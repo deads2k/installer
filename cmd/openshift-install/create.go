@@ -7,18 +7,19 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
+
+	"k8s.io/apimachinery/pkg/util/sets"
+
+	"k8s.io/apimachinery/pkg/labels"
 
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes"
@@ -29,6 +30,8 @@ import (
 
 	configv1 "github.com/openshift/api/config/v1"
 	configclient "github.com/openshift/client-go/config/clientset/versioned"
+	configinformers "github.com/openshift/client-go/config/informers/externalversions"
+	configlisters "github.com/openshift/client-go/config/listers/config/v1"
 	routeclient "github.com/openshift/client-go/route/clientset/versioned"
 	"github.com/openshift/installer/pkg/asset"
 	"github.com/openshift/installer/pkg/asset/agent/agentconfig"
@@ -578,28 +581,24 @@ func waitForStableOperators(ctx context.Context, config *rest.Config) error {
 	if err != nil {
 		return errors.Wrap(err, "failed to create a config client")
 	}
-
-	coNames, err := getClusterOperatorNames(ctx, cc)
-	if err != nil {
-		return err
+	configInformers := configinformers.NewSharedInformerFactory(cc, 0)
+	clusterOperatorInformer := configInformers.Config().V1().ClusterOperators().Informer()
+	clusterOperatorLister := configInformers.Config().V1().ClusterOperators().Lister()
+	configInformers.Start(ctx.Done())
+	if !cache.WaitForCacheSync(ctx.Done(), clusterOperatorInformer.HasSynced) {
+		return fmt.Errorf("informers never started")
 	}
 
-	// stabilityCheck closure maintains state of whether any cluster operator
-	// encounters a stability error
-	stabilityCheck := coStabilityChecker()
+	waitErr := wait.PollUntilContextCancel(stabilityContext, 1*time.Second, true, waitForAllClusterOperators(clusterOperatorLister))
+	if waitErr != nil {
+		logrus.Errorf("Error checking cluster operator Progressing status: %q", waitErr)
+		stableOperators, unstableOperators, err := currentOperatorStability(clusterOperatorLister)
+		if err != nil {
+			logrus.Errorf("Error checking final cluster operator Progressing status: %q", err)
+		}
+		logrus.Debug("These cluster operators were stable: [%s]", strings.Join(stableOperators.List(), ", "))
+		logrus.Errorf("These cluster operators were not stable: [%s]", strings.Join(unstableOperators.List(), ", "))
 
-	var wg sync.WaitGroup
-	for _, co := range coNames {
-		wg.Add(1)
-		go func(co string) {
-			defer wg.Done()
-			status, statusErr := getCOProgressingStatus(stabilityContext, cc, co)
-			err = stabilityCheck(co, status, statusErr)
-		}(co)
-	}
-	wg.Wait()
-
-	if err != nil {
 		logrus.Exit(exitCodeOperatorStabilityFailed)
 	}
 
@@ -721,264 +720,59 @@ func checkIfAgentCommand(assetStore asset.Store) {
 	}
 }
 
-func getClusterOperatorNames(ctx context.Context, cc *configclient.Clientset) ([]string, error) {
-	listCtx, cancel := context.WithTimeout(ctx, 1*time.Minute)
-	defer cancel()
+func waitForAllClusterOperators(clusterOperatorLister configlisters.ClusterOperatorLister) func(ctx context.Context) (bool, error) {
+	previouslyStableOperators := sets.String{}
 
-	cos, err := cc.ConfigV1().ClusterOperators().List(listCtx, metav1.ListOptions{})
-	if err != nil {
-		return nil, err
-	}
-
-	names := make([]string, 0, len(cos.Items))
-	for _, v := range cos.Items {
-		names = append(names, v.Name)
-	}
-	return names, nil
-}
-
-func getCOProgressingStatus(ctx context.Context, cc *configclient.Clientset, name string) (*configv1.ClusterOperatorStatusCondition, error) {
-	var coListWatcher cache.ListerWatcher
-	coListWatcher = cache.NewListWatchFromClient(cc.ConfigV1().RESTClient(),
-		"clusteroperators",
-		"",
-		fields.OneTermEqualSelector("metadata.name", name))
-	coListWatcher = replayingListWatcher(coListWatcher)
-
-	var pStatus *configv1.ClusterOperatorStatusCondition
-
-	_, err := clientwatch.UntilWithSync(
-		ctx,
-		coListWatcher,
-		&configv1.ClusterOperator{},
-		nil,
-		func(event watch.Event) (bool, error) {
-			switch event.Type {
-			case watch.Added, watch.Modified:
-				cos, ok := event.Object.(*configv1.ClusterOperator)
-				if !ok {
-					logrus.Debugf("Cluster Operator %s status not found", name)
-					return false, nil
-				}
-				progressing := cov1helpers.FindStatusCondition(cos.Status.Conditions, configv1.OperatorProgressing)
-				if progressing == nil {
-					logrus.Debugf("Cluster Operator %s progressing == nil", name)
-					return false, nil
-				}
-				pStatus = progressing
-
-				if meetsStabilityThreshold(pStatus) {
-					logrus.Debugf("Cluster Operator %s is stable", name)
-					return true, nil
-				}
-				logrus.Debugf("Cluster Operator %s is Progressing=%s LastTransitionTime=%v DurationSinceTransition=%.fs Reason=%s Message=%s", name, progressing.Status, progressing.LastTransitionTime.Time, time.Since(progressing.LastTransitionTime.Time).Seconds(), progressing.Reason, progressing.Message)
+	return func(ctx context.Context) (bool, error) {
+		stableOperators, unstableOperators, err := currentOperatorStability(clusterOperatorLister)
+		if err != nil {
+			return false, err
+		}
+		if newlyStableOperators := stableOperators.Difference(previouslyStableOperators); len(newlyStableOperators) > 0 {
+			for _, name := range newlyStableOperators.List() {
+				logrus.Debugf("Cluster Operator %s is stable", name)
 			}
-			return false, nil
-		},
-	)
-	return pStatus, err
-}
+		}
+		if newlyUnstableOperators := previouslyStableOperators.Difference(stableOperators); len(newlyUnstableOperators) > 0 {
+			for _, name := range newlyUnstableOperators.List() {
+				logrus.Debugf("Cluster Operator %s became unstable", name)
+			}
+		}
+		previouslyStableOperators = stableOperators
 
-type replayingListWatch struct {
-	delegate cache.ListerWatcher
+		if len(unstableOperators) == 0 {
+			return true, nil
+		}
 
-	lastListItem *watch.Event
-	lastLock     sync.Mutex
-	name         string
-}
-
-func (r *replayingListWatch) List(options metav1.ListOptions) (runtime.Object, error) {
-	uncastList, err := r.delegate.List(options)
-	if err != nil {
-		return nil, err
-	}
-	items, err := meta.ExtractList(uncastList)
-	if err != nil {
-		return nil, fmt.Errorf("unable to understand list result %#v (%w)", uncastList, err)
-	}
-	if len(items) == 0 {
-		return uncastList, nil
-	}
-	lastItem := items[len(items)-1]
-	// we know this should be a clusteroperator, if testing fails on this, hardconvert it here.
-
-	r.lastLock.Lock()
-	defer r.lastLock.Unlock()
-	if metadata, err := meta.Accessor(lastItem); err == nil {
-		r.name = metadata.GetName()
-	} else {
-		r.name = err.Error()
-	}
-	r.lastListItem = &watch.Event{
-		Type:   watch.Added,
-		Object: lastItem,
-	}
-
-	return uncastList, nil
-}
-
-// Watch is called strictly after List because it needs a resourceVersion.
-func (r *replayingListWatch) Watch(options metav1.ListOptions) (watch.Interface, error) {
-	w, err := r.delegate.Watch(options)
-	if err != nil {
-		return w, err
-	}
-
-	r.lastLock.Lock()
-	defer r.lastLock.Unlock()
-	return wrapWithReplay(context.TODO(), w, r.name, r.lastListItem.DeepCopy()), nil
-}
-
-func wrapWithReplay(ctx context.Context, w watch.Interface, name string, initialLastEvent *watch.Event) watch.Interface {
-	fw := &replayingWatch{
-		name:     name,
-		incoming: w,
-		result:   make(chan watch.Event),
-	}
-	if initialLastEvent != nil {
-		fw.updateLastObservedEvent(*initialLastEvent)
-	}
-
-	go fw.watchIncoming(ctx)
-	go fw.resendLast(ctx)
-	return fw
-}
-
-type replayingWatch struct {
-	name string
-
-	incoming watch.Interface
-	result   chan watch.Event
-
-	lastLock sync.Mutex
-	last     watch.Event
-	stopped  bool
-}
-
-func (r *replayingWatch) ResultChan() <-chan watch.Event {
-	return r.result
-}
-
-func (r *replayingWatch) Stop() {
-	logrus.Debugf("Waiting for Stop lock for Cluster Operator %s", r.name)
-	r.lastLock.Lock()
-	defer r.lastLock.Unlock()
-	logrus.Debugf("Aquired lock for stop for Cluster Operator %s", r.name)
-
-	r.incoming.Stop()
-	r.stopped = true
-	close(r.result)
-}
-
-func (r *replayingWatch) updateLastObservedEvent(event watch.Event) {
-	switch event.Type {
-	case watch.Bookmark, watch.Error:
-		logrus.Debugf("updateLastObservedEvent ignoring %v, we will continue sending the previous last Cluster Operator %s", event.Type, r.name)
-		return
-	}
-
-	logrus.Debugf("Waiting for updateLastObservedEvent lock for Cluster Operator %s", r.name)
-	r.lastLock.Lock()
-	defer r.lastLock.Unlock()
-	logrus.Debugf("Aquired lock for updateLastObservedEvent for Cluster Operator %s", r.name)
-
-	r.last = copyWatchEvent(event)
-}
-
-var emptyEvent watch.Event
-
-func (r *replayingWatch) Replay(ctx context.Context) (bool, error) {
-	logrus.Debugf("Waiting for Replay lock for Cluster Operator %s", r.name)
-	r.lastLock.Lock()
-	defer r.lastLock.Unlock()
-	logrus.Debugf("Aquired lock for Replay for Cluster Operator %s", r.name)
-
-	if r.last == emptyEvent {
-		logrus.Debugf("No event to send for Cluster Operator %s", r.name)
 		return false, nil
 	}
-
-	r.sendToResultLocked(ctx, copyWatchEvent(r.last))
-
-	return false, nil
 }
 
-func (r *replayingWatch) sendToResult(ctx context.Context, watchEvent watch.Event) {
-	logrus.Debugf("Waiting for sendToResult lock for Cluster Operator %s", r.name)
-	r.lastLock.Lock()
-	defer r.lastLock.Unlock()
-	logrus.Debugf("Aquired lock for sendToResult for Cluster Operator %s", r.name)
-
-	r.sendToResultLocked(ctx, watchEvent)
-}
-
-func (r *replayingWatch) sendToResultLocked(ctx context.Context, watchEvent watch.Event) {
-	if r.stopped {
-		logrus.Debugf("sendToResultLocked sees stop request, not sending for Cluster Operator %s", r.name)
-		return
-	}
-
-	logrus.Debugf("sendToResultLocked is about to send to unbuffered channel for Cluster Operator %s", r.name)
-	select {
-	case r.result <- watchEvent:
-		logrus.Debugf("sendToResultLocked sent to unbuffered channel for Cluster Operator %s", r.name)
-	case <-ctx.Done():
-		logrus.Debugf("sendToResultLocked sees closed context Cluster Operator %s", r.name)
-	}
-}
-
-func (r *replayingWatch) watchIncoming(ctx context.Context) {
-	for event := range r.incoming.ResultChan() {
-		r.sendToResult(ctx, event)
-		r.updateLastObservedEvent(event)
-	}
-
-	logrus.Debugf("Finishing watchIncomfing clusteroperator/%s", r.name)
-}
-
-func copyWatchEvent(event watch.Event) watch.Event {
-	return watch.Event{
-		Type:   event.Type,
-		Object: event.Object.DeepCopyObject(),
-	}
-}
-
-func (r *replayingWatch) resendLast(ctx context.Context) {
-	err := wait.PollUntilContextCancel(ctx, time.Second, false, r.Replay)
+func currentOperatorStability(clusterOperatorLister configlisters.ClusterOperatorLister) (sets.String, sets.String, error) {
+	clusterOperators, err := clusterOperatorLister.List(labels.Everything())
 	if err != nil {
-		logrus.Debugf("Watcher polling error: %v", err)
+		return nil, nil, err // lister should never fail
 	}
-}
 
-func replayingListWatcher(in cache.ListerWatcher) cache.ListerWatcher {
-	return &replayingListWatch{
-		delegate: in,
-	}
-}
-
-// coStabilityChecker returns a closure which references a shared error variable. err
-// tracks whether any operator has had a stability error. The closure function will
-// return an error if any operator has had an instability error, even if the operator
-// currently being checked is stable.
-func coStabilityChecker() func(string, *configv1.ClusterOperatorStatusCondition, error) error {
-	var err error
-
-	return func(name string, status *configv1.ClusterOperatorStatusCondition, statusErr error) error {
-		if statusErr == nil {
-			return err
+	stableOperators := sets.String{}
+	unstableOperators := sets.String{}
+	for _, clusterOperator := range clusterOperators {
+		name := clusterOperator.Name
+		progressing := cov1helpers.FindStatusCondition(clusterOperator.Status.Conditions, configv1.OperatorProgressing)
+		if progressing == nil {
+			logrus.Debugf("Cluster Operator %s progressing == nil", name)
+			unstableOperators.Insert(name)
+			continue
 		}
-		if !wait.Interrupted(statusErr) {
-			logrus.Errorf("Error checking cluster operator %s Progressing status: %q", name, statusErr)
-			err = errors.New("cluster operators are not stable")
-		}
-		if meetsStabilityThreshold(status) {
-			logrus.Debugf("Cluster operator %s is now stable: Progressing=%s LastTransitionTime=%v DurationSinceTransition=%.fs Reason=%s Message=%s", name, status.Status, status.LastTransitionTime.Time, time.Since(status.LastTransitionTime.Time).Seconds(), status.Reason, status.Message)
+		if meetsStabilityThreshold(progressing) {
+			stableOperators.Insert(name)
 		} else {
-			logrus.Errorf("Cluster operator %s does not meet stability threshold of Progressing=false for greater than %.f seconds with Reason: %q and Message: %q", name, coStabilityThreshold, status.Reason, status.Message)
-			err = errors.New("cluster operators are not stable")
+			logrus.Debugf("Cluster Operator %s is Progressing=%s LastTransitionTime=%v DurationSinceTransition=%.fs Reason=%s Message=%s", name, progressing.Status, progressing.LastTransitionTime.Time, time.Since(progressing.LastTransitionTime.Time).Seconds(), progressing.Reason, progressing.Message)
+			unstableOperators.Insert(name)
 		}
-		return err
 	}
+
+	return stableOperators, unstableOperators, nil
 }
 
 func meetsStabilityThreshold(progressing *configv1.ClusterOperatorStatusCondition) bool {
